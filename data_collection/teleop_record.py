@@ -277,7 +277,7 @@ class TeleopRecorder:
                 self.record_one_trajectory(instruction, trajectory_idx=i)
 
                 if i < num_trajectories - 1:
-                    print("\n请将物体复位，准备下一条轨迹...")
+                    print("\n请将物体复位, 准备下一条轨迹...")
                     input("按 Enter 继续...")
 
         except KeyboardInterrupt:

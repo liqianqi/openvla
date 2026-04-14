@@ -47,11 +47,11 @@ class ArmConfig:
     # 每个电机的校准参数: direction(+1/-1) 和 homing_offset(rad)
     # 根据你的装配实际情况修改
     calibration: dict = field(default_factory=lambda: {
-        "J1": {"direction": 1, "homing_offset": 0.0},
+        "J1": {"direction": -1, "homing_offset": 0.0},
         "J2": {"direction": 1, "homing_offset": 0.0},
-        "J3": {"direction": 1, "homing_offset": 0.0},
+        "J3": {"direction": -1, "homing_offset": 0.0},
         "J4": {"direction": 1, "homing_offset": 0.0},
-        "J5": {"direction": 1, "homing_offset": 0.0},
+        "J5": {"direction": -1, "homing_offset": 0.0},
         "J6": {"direction": 1, "homing_offset": 0.0},
         "gripper": {"direction": 1, "homing_offset": 0.0},
     })
@@ -108,25 +108,41 @@ class ELA3Arm:
         self.bus.disable("gripper")
         print(f"[{self.name}] 所有电机已失能")
 
+    # ── 校准工具 ───────────────────────────────────────────
+
+    def _apply_calibration(self, joint: str, raw_pos: float) -> float:
+        """电机原始角度 → URDF 约定角度：raw * direction + homing_offset"""
+        cal = self.config.calibration.get(joint, {})
+        direction = cal.get("direction", 1)
+        offset = cal.get("homing_offset", 0.0)
+        return raw_pos * direction + offset
+
+    def _inverse_calibration(self, joint: str, urdf_pos: float) -> float:
+        """URDF 约定角度 → 电机原始角度：(urdf - homing_offset) / direction"""
+        cal = self.config.calibration.get(joint, {})
+        direction = cal.get("direction", 1)
+        offset = cal.get("homing_offset", 0.0)
+        return (urdf_pos - offset) / direction
+
     # ── 读取 ─────────────────────────────────────────────
 
     def read_joint_positions(self) -> np.ndarray:
         """
-        读取 6 个关节的当前角度 (rad)。
+        读取 6 个关节的当前角度 (rad)，已应用 calibration 修正。
 
         Returns:
             np.ndarray: shape (6,), [q1, q2, q3, q4, q5, q6]
         """
         positions = np.zeros(6, dtype=np.float64)
         for i, joint in enumerate(JOINT_NAMES):
-            pos = self.bus.read(joint, ParameterType.MEASURED_POSITION)
-            positions[i] = float(pos)
+            raw = float(self.bus.read(joint, ParameterType.MEASURED_POSITION))
+            positions[i] = self._apply_calibration(joint, raw)
         return positions
 
     def read_joint_positions_mit(self) -> np.ndarray:
         """
         通过发送零力矩的 MIT 帧来同时读取关节位置。
-        比逐个 read 更快，适合高频循环。
+        比逐个 read 更快，适合高频循环。已应用 calibration 修正。
 
         Returns:
             np.ndarray: shape (6,), [q1, q2, q3, q4, q5, q6]
@@ -135,40 +151,45 @@ class ELA3Arm:
         for i, joint in enumerate(JOINT_NAMES):
             self.bus.write_operation_frame(joint, position=0, kp=0, kd=0, velocity=0, torque=0)
             pos, vel, torque, temp = self.bus.read_operation_frame(joint)
-            positions[i] = pos
+            positions[i] = self._apply_calibration(joint, pos)
         return positions
 
     def read_gripper_position(self) -> float:
-        """读取夹爪位置 (rad)"""
-        return float(self.bus.read("gripper", ParameterType.MEASURED_POSITION))
+        """读取夹爪位置 (rad)，已应用 calibration 修正。"""
+        raw = float(self.bus.read("gripper", ParameterType.MEASURED_POSITION))
+        return self._apply_calibration("gripper", raw)
 
     # ── 控制 ─────────────────────────────────────────────
 
     def set_joint_positions(self, positions: np.ndarray, kp: float = 30.0, kd: float = 1.0):
         """
         MIT 模式位置控制，发送 6 个关节目标位置。
+        输入为 URDF 约定角度，内部自动转换为电机原始角度。
 
         Args:
-            positions: shape (6,), 目标关节角度 (rad)
+            positions: shape (6,), 目标关节角度 (rad), URDF 约定
             kp: 位置增益
             kd: 阻尼增益
         """
         for i, joint in enumerate(JOINT_NAMES):
             lo, hi = JOINT_LIMITS[joint]
             target = float(np.clip(positions[i], lo, hi))
-            self.bus.write_operation_frame(joint, position=target, kp=kp, kd=kd)
+            raw_target = self._inverse_calibration(joint, target)
+            self.bus.write_operation_frame(joint, position=raw_target, kp=kp, kd=kd)
             self.bus.read_operation_frame(joint)
 
     def set_gripper(self, position: float, kp: float = 20.0, kd: float = 0.5):
         """
         控制夹爪位置。
+        输入为 URDF 约定角度，内部自动转换为电机原始角度。
 
         Args:
             position: 夹爪目标位置 (rad), 0=关闭, 正值=打开
             kp: 位置增益
             kd: 阻尼增益
         """
-        self.bus.write_operation_frame("gripper", position=position, kp=kp, kd=kd)
+        raw_pos = self._inverse_calibration("gripper", position)
+        self.bus.write_operation_frame("gripper", position=raw_pos, kp=kp, kd=kd)
         self.bus.read_operation_frame("gripper")
 
     # ── Leader 模式 (低刚度，可手动拖拽) ────────────────
