@@ -178,31 +178,62 @@ class TeleopRecorder:
         t.start()
 
         step = 0
+        control_cycles = 0
+        camera_errors = 0
+        motor_errors = 0
+        max_camera_errors = 10
+        max_motor_errors = 10
+        record_interval = dt
+        last_record_time = 0.0
+
         try:
             while not stop_flag.is_set():
-                t_start = time.time()
+                # ── 控制 (全速运行，不限频) ──
+                try:
+                    leader_joints = self.leader.read_joint_positions_mit()
+                    leader_gripper = self.leader.read_gripper_position_mit()
+                    self.follower.follow(
+                        leader_joints,
+                        leader_gripper,
+                        kp=self.config.follower_kp,
+                        kd=self.config.follower_kd,
+                        gripper_kp=self.config.follower_gripper_kp,
+                        gripper_kd=self.config.follower_gripper_kd,
+                    )
+                except RuntimeError as e:
+                    motor_errors += 1
+                    print(f"  [WARN] 电机异常 ({motor_errors}/{max_motor_errors}): {e}")
+                    self.leader.bus._flush_rx_buffer()
+                    self.follower.bus._flush_rx_buffer()
+                    if motor_errors >= max_motor_errors:
+                        print("  [ERROR] 电机连续失败次数过多，停止录制")
+                        break
+                    time.sleep(0.05)
+                    continue
 
-                # 1) 读取 leader 状态
-                leader_joints = self.leader.read_joint_positions_mit()
-                leader_gripper = self.leader.read_gripper_position()
+                motor_errors = 0
+                control_cycles += 1
 
-                # 2) Follower 跟随
-                self.follower.follow(
-                    leader_joints,
-                    leader_gripper,
-                    kp=self.config.follower_kp,
-                    kd=self.config.follower_kd,
-                    gripper_kp=self.config.follower_gripper_kp,
-                    gripper_kd=self.config.follower_gripper_kd,
-                )
+                # ── 录制 (按 hz 采样) ──
+                now = time.time()
+                if now - last_record_time < record_interval:
+                    continue
+                last_record_time = now
 
-                # 3) 拍照 (拍 follower 的工作场景)
-                image = self.camera.capture_rgb()
+                try:
+                    image = self.camera.capture_rgb()
+                except RuntimeError as e:
+                    camera_errors += 1
+                    print(f"  [WARN] 相机异常 ({camera_errors}/{max_camera_errors}): {e}")
+                    if camera_errors >= max_camera_errors:
+                        print("  [ERROR] 相机连续失败次数过多，停止录制")
+                        break
+                    continue
 
-                # 4) FK 计算末端位姿
+                camera_errors = 0
+
                 eef_pose = forward_kinematics(leader_joints)
 
-                # 5) 记录
                 images.append(image)
                 eef_poses.append(eef_pose)
                 gripper_states.append(leader_gripper)
@@ -210,19 +241,19 @@ class TeleopRecorder:
 
                 step += 1
                 if step % 10 == 0:
+                    ctrl_hz = control_cycles / (now - (now - control_cycles * 0.001)) if control_cycles else 0
                     print(f"  step {step:4d} | EEF: [{eef_pose[0]:.3f}, {eef_pose[1]:.3f}, {eef_pose[2]:.3f}]"
-                          f" | gripper: {leader_gripper:.3f}")
-
-                # 控制频率
-                elapsed = time.time() - t_start
-                sleep_time = dt - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                          f" | gripper: {leader_gripper:.3f}"
+                          f" | ctrl: {control_cycles} cycles")
 
         except KeyboardInterrupt:
             print("\n录制被中断")
 
         print(f"录制完成: {step} 步 ({step / self.config.hz:.1f} 秒)")
+
+        if step == 0:
+            print("WARNING: 本条轨迹无有效数据，跳过保存")
+            return ""
 
         # 保存到 HDF5
         filepath = os.path.join(

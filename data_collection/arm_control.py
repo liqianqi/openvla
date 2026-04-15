@@ -103,9 +103,11 @@ class ELA3Arm:
         print(f"[{self.name}] 所有电机已使能")
 
     def disable_all(self):
-        for joint in JOINT_NAMES:
-            self.bus.disable(joint)
-        self.bus.disable("gripper")
+        for motor in JOINT_NAMES + ["gripper"]:
+            try:
+                self.bus.disable(motor)
+            except Exception as e:
+                print(f"WARNING: 失能 {motor} 失败: {e}")
         print(f"[{self.name}] 所有电机已失能")
 
     # ── 校准工具 ───────────────────────────────────────────
@@ -142,7 +144,8 @@ class ELA3Arm:
     def read_joint_positions_mit(self) -> np.ndarray:
         """
         通过发送零力矩的 MIT 帧来同时读取关节位置。
-        比逐个 read 更快，适合高频循环。已应用 calibration 修正。
+        比逐个 read 更快，适合高频循环。
+        bus 层的 read_operation_frame 已处理 calibration，此处不再重复。
 
         Returns:
             np.ndarray: shape (6,), [q1, q2, q3, q4, q5, q6]
@@ -151,20 +154,29 @@ class ELA3Arm:
         for i, joint in enumerate(JOINT_NAMES):
             self.bus.write_operation_frame(joint, position=0, kp=0, kd=0, velocity=0, torque=0)
             pos, vel, torque, temp = self.bus.read_operation_frame(joint)
-            positions[i] = self._apply_calibration(joint, pos)
+            positions[i] = pos
         return positions
 
     def read_gripper_position(self) -> float:
-        """读取夹爪位置 (rad)，已应用 calibration 修正。"""
+        """读取夹爪位置 (rad)，通过参数读取，已应用 calibration 修正。"""
         raw = float(self.bus.read("gripper", ParameterType.MEASURED_POSITION))
         return self._apply_calibration("gripper", raw)
+
+    def read_gripper_position_mit(self) -> float:
+        """
+        通过 MIT 帧读取夹爪位置，同时保持夹爪在 MIT 模式下活跃。
+        bus 层的 read_operation_frame 已处理 calibration，此处不再重复。
+        """
+        self.bus.write_operation_frame("gripper", position=0, kp=0, kd=0, velocity=0, torque=0)
+        pos, vel, torque, temp = self.bus.read_operation_frame("gripper")
+        return pos
 
     # ── 控制 ─────────────────────────────────────────────
 
     def set_joint_positions(self, positions: np.ndarray, kp: float = 30.0, kd: float = 1.0):
         """
         MIT 模式位置控制，发送 6 个关节目标位置。
-        输入为 URDF 约定角度，内部自动转换为电机原始角度。
+        输入为 URDF 约定角度，bus 层的 write_operation_frame 负责转换为电机原始角度。
 
         Args:
             positions: shape (6,), 目标关节角度 (rad), URDF 约定
@@ -174,22 +186,20 @@ class ELA3Arm:
         for i, joint in enumerate(JOINT_NAMES):
             lo, hi = JOINT_LIMITS[joint]
             target = float(np.clip(positions[i], lo, hi))
-            raw_target = self._inverse_calibration(joint, target)
-            self.bus.write_operation_frame(joint, position=raw_target, kp=kp, kd=kd)
+            self.bus.write_operation_frame(joint, position=target, kp=kp, kd=kd)
             self.bus.read_operation_frame(joint)
 
     def set_gripper(self, position: float, kp: float = 20.0, kd: float = 0.5):
         """
         控制夹爪位置。
-        输入为 URDF 约定角度，内部自动转换为电机原始角度。
+        输入为 URDF 约定角度，bus 层的 write_operation_frame 负责转换为电机原始角度。
 
         Args:
             position: 夹爪目标位置 (rad), 0=关闭, 正值=打开
             kp: 位置增益
             kd: 阻尼增益
         """
-        raw_pos = self._inverse_calibration("gripper", position)
-        self.bus.write_operation_frame("gripper", position=raw_pos, kp=kp, kd=kd)
+        self.bus.write_operation_frame("gripper", position=position, kp=kp, kd=kd)
         self.bus.read_operation_frame("gripper")
 
     # ── Leader 模式 (低刚度，可手动拖拽) ────────────────

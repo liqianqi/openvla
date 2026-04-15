@@ -1,7 +1,7 @@
 """
 test_realsense.py
 
-打开 RealSense D435，采集彩色图 + 左红外图，保存为 PNG。
+打开 RealSense D435, 采集彩色图 + 左红外图，保存为 PNG。
 无 GUI 依赖，适用于远程/无显示器环境。
 """
 
